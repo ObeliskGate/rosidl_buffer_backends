@@ -16,8 +16,12 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
 
-#include <cstring>
-#include <vector>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 #include "hip_buffer/hip_buffer_api.hpp"
 #include "rosidl_buffer/buffer.hpp"
@@ -63,6 +67,207 @@ protected:
   hipStream_t stream1_{nullptr};
   hipStream_t stream2_{nullptr};
 };
+
+// Ported from the CUDA regression in PR #28 by Yuankun Zhu (dfbcc63885ff).
+TEST_F(HipBufferTest, RecyclerDoesNotBlockReadyBuffersBehindPendingWork)
+{
+  struct Gate
+  {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false};
+    bool open{false};
+    bool finished{false};
+    bool launched{false};
+
+    void release()
+    {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        open = true;
+      }
+      cv.notify_all();
+    }
+
+    bool wait_for_entry()
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      return cv.wait_for(lock, std::chrono::seconds(5), [this] {return entered;});
+    }
+
+    bool wait_until_finished(std::chrono::steady_clock::time_point deadline)
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      return !launched || cv.wait_until(lock, deadline, [this] {return finished;});
+    }
+  };
+  struct CallbackData {std::shared_ptr<Gate> gate;};
+  struct ReleaseState
+  {
+    std::atomic<bool> expected{false};
+    std::atomic<bool> released{false};
+
+    bool wait_until(std::chrono::steady_clock::time_point deadline)
+    {
+      while (expected.load() && !released.load() &&
+        std::chrono::steady_clock::now() < deadline)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      return !expected.load() || released.load();
+    }
+  };
+  struct EventOwner
+  {
+    hipEvent_t event{nullptr};
+    bool recorded{false};
+
+    ~EventOwner() {if (event) {(void)hipEventDestroy(event);}}
+
+    hipEvent_t release()
+    {
+      hipEvent_t owned = event;
+      event = nullptr;
+      recorded = false;
+      return owned;
+    }
+
+    bool wait_until_complete(std::chrono::steady_clock::time_point deadline)
+    {
+      while (recorded && std::chrono::steady_clock::now() < deadline) {
+        const hipError_t status = hipEventQuery(event);
+        if (status == hipSuccess) {return true;}
+        if (status != hipErrorNotReady) {
+          (void)hipGetLastError();
+          return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      return !recorded;
+    }
+  };
+
+  auto pending_gate = std::make_shared<Gate>();
+  auto later_gate = std::make_shared<Gate>();
+  auto pending_released = std::make_shared<ReleaseState>();
+  auto later_released = std::make_shared<ReleaseState>();
+  EventOwner pending_event;
+  EventOwner later_event;
+  // Separate tail markers let bounded waits avoid querying recycler-owned events.
+  EventOwner pending_tail;
+  EventOwner later_tail;
+  ASSERT_EQ(hipSuccess, hipEventCreateWithFlags(&pending_event.event, hipEventDisableTiming));
+  ASSERT_EQ(hipSuccess, hipEventCreateWithFlags(&later_event.event, hipEventDisableTiming));
+  ASSERT_EQ(hipSuccess, hipEventCreateWithFlags(&pending_tail.event, hipEventDisableTiming));
+  ASSERT_EQ(hipSuccess, hipEventCreateWithFlags(&later_tail.event, hipEventDisableTiming));
+
+  struct Cleanup
+  {
+    std::shared_ptr<Gate> pending_gate;
+    std::shared_ptr<Gate> later_gate;
+    std::shared_ptr<ReleaseState> pending_released;
+    std::shared_ptr<ReleaseState> later_released;
+    EventOwner * pending_tail;
+    EventOwner * later_tail;
+
+    ~Cleanup()
+    {
+      pending_gate->release();
+      later_gate->release();
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      (void)pending_gate->wait_until_finished(deadline);
+      (void)later_gate->wait_until_finished(deadline);
+      (void)pending_tail->wait_until_complete(deadline);
+      (void)later_tail->wait_until_complete(deadline);
+      (void)pending_released->wait_until(deadline);
+      (void)later_released->wait_until(deadline);
+    }
+  } cleanup{
+    pending_gate, later_gate, pending_released, later_released, &pending_tail, &later_tail};
+
+  auto wait_for_gate = [](void * raw) {
+      std::unique_ptr<CallbackData> data(static_cast<CallbackData *>(raw));
+      const auto gate = data->gate;
+      std::unique_lock<std::mutex> lock(gate->mutex);
+      gate->entered = true;
+      gate->cv.notify_all();
+      gate->cv.wait(lock, [&gate] {return gate->open;});
+      gate->finished = true;
+      lock.unlock();
+      gate->cv.notify_all();
+    };
+  auto enqueue_callback = [&](hipStream_t stream, const std::shared_ptr<Gate> & gate) {
+      auto data = std::make_unique<CallbackData>();
+      data->gate = gate;
+      const hipError_t status = hipLaunchHostFunc(stream, wait_for_gate, data.get());
+      if (status == hipSuccess) {
+        data.release();
+        std::lock_guard<std::mutex> lock(gate->mutex);
+        gate->launched = true;
+      }
+      return status;
+    };
+
+  hipError_t status = enqueue_callback(stream2_, later_gate);
+  if (status == hipErrorNotSupported) {
+    GTEST_SKIP() << "HIP SDK does not support host-function callbacks";
+  }
+  ASSERT_EQ(hipSuccess, status);
+  ASSERT_EQ(hipSuccess, hipEventRecord(later_event.event, stream2_));
+  later_event.recorded = true;
+  ASSERT_EQ(hipSuccess, hipEventRecord(later_tail.event, stream2_));
+  later_tail.recorded = true;
+  ASSERT_TRUE(later_gate->wait_for_entry())
+    << "HIP runtime did not start the later host callback";
+
+  status = enqueue_callback(stream1_, pending_gate);
+  if (status == hipErrorNotSupported) {
+    GTEST_SKIP() << "HIP SDK does not support host-function callbacks";
+  }
+  ASSERT_EQ(hipSuccess, status);
+  ASSERT_EQ(hipSuccess, hipEventRecord(pending_event.event, stream1_));
+  pending_event.recorded = true;
+  ASSERT_EQ(hipSuccess, hipEventRecord(pending_tail.event, stream1_));
+  pending_tail.recorded = true;
+
+  auto pending = std::make_unique<hip_buffer_backend::HipBuffer>(
+    new uint8_t{}, 1, 0, [pending_released](uint8_t * ptr) {
+      delete ptr;
+      pending_released->released.store(true);
+    });
+  pending_released->expected.store(true);
+  pending->set_write_event(pending_event.release(), true);
+  pending.reset();
+  auto later = std::make_unique<hip_buffer_backend::HipBuffer>(
+    new uint8_t{}, 1, 0, [later_released](uint8_t * ptr) {
+      delete ptr;
+      later_released->released.store(true);
+    });
+  later_released->expected.store(true);
+  later->set_write_event(later_event.release(), true);
+  later.reset();
+
+  later_gate->release();
+  ASSERT_TRUE(later_tail.wait_until_complete(
+      std::chrono::steady_clock::now() + std::chrono::seconds(5)))
+    << "later stream work did not drain after releasing its host callback";
+  EXPECT_TRUE(later_released->wait_until(
+      std::chrono::steady_clock::now() + std::chrono::seconds(1)))
+    << "ready buffer remained queued behind earlier pending work";
+  EXPECT_FALSE(pending_released->released.load())
+    << "first buffer was released while its host callback remained blocked";
+
+  pending_gate->release();
+  ASSERT_TRUE(pending_tail.wait_until_complete(
+      std::chrono::steady_clock::now() + std::chrono::seconds(5)))
+    << "first stream work did not drain after releasing its host callback";
+  EXPECT_TRUE(pending_released->wait_until(
+      std::chrono::steady_clock::now() + std::chrono::seconds(5)))
+    << "first buffer deleter did not run after its work completed";
+  EXPECT_TRUE(later_released->wait_until(
+      std::chrono::steady_clock::now() + std::chrono::seconds(5)))
+    << "later buffer deleter did not run after its work completed";
+}
 
 TEST_F(HipBufferTest, AllocateAndWriteHandle)
 {

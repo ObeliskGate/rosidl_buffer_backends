@@ -33,17 +33,18 @@ namespace hip_buffer_backend
 HipMemoryPool::~HipMemoryPool()
 {
   for (;; ) {
-    bool all_ready = true;
+    bool has_pending_block = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      // Pending work can make progress. A terminal HIP error cannot, so the
+      // final cleanup below handles it once instead of retrying forever.
       for (auto & block : all_blocks_) {
-        if (!is_block_ready(block.get())) {
-          all_ready = false;
-          break;
+        if (get_block_readiness(block.get()) == BlockReadiness::Pending) {
+          has_pending_block = true;
         }
       }
     }
-    if (all_ready) {
+    if (!has_pending_block) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -51,6 +52,11 @@ HipMemoryPool::~HipMemoryPool()
 
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto & block : all_blocks_) {
+    if (block->exported_event) {
+      hipEventDestroy(block->exported_event);
+      block->exported_event = nullptr;
+      (void)hipGetLastError();
+    }
     if (block->ipc_meta) {
       munmap(block->ipc_meta, sizeof(IPCMetadata));
       block->ipc_meta = nullptr;
@@ -143,7 +149,7 @@ VmmBlock * HipMemoryPool::allocate(size_t byte_size)
     // would incur. A std::list would also give O(1) erase, but its scattered
     // heap nodes cost more per-iteration than the cache-friendly vector scan.
     for (size_t i = 0; i < vec.size(); ++i) {
-      if (is_block_ready(vec[i])) {
+      if (get_block_readiness(vec[i]) == BlockReadiness::Ready) {
         VmmBlock * block = vec[i];
         vec[i] = vec.back();
         vec.pop_back();
@@ -168,30 +174,91 @@ void HipMemoryPool::free(VmmBlock * block)
   free_blocks_[block->size].push_back(block);
 }
 
-bool HipMemoryPool::is_block_ready(VmmBlock * block) const
+void HipMemoryPool::retain_exported_event(
+  VmmBlock * block, hipEvent_t event, uint64_t uid)
 {
-  if (!block->ipc_meta) {
-    return true;
+  if (!block || !event || uid == 0) {
+    throw HipError("Cannot retain an invalid exported HIP event");
   }
 
-  int32_t rc = block->ipc_meta->refcount.load(std::memory_order_acquire);
-  if (rc > 0) {
-    return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (block->current_uid != uid) {
+    throw HipError("Cannot retain a HIP event for a stale block generation");
+  }
+  if (block->exported_event && block->exported_event != event) {
+    throw HipError("A different HIP event is already exported for this block generation");
+  }
+  block->exported_event = event;
+  block->exported_event_retirement_failed = false;
+}
+
+HipMemoryPool::BlockReadiness HipMemoryPool::retire_exported_event(VmmBlock * block)
+{
+  if (block->exported_event_retirement_failed) {
+    return BlockReadiness::TerminalError;
+  }
+  if (!block->exported_event) {
+    return BlockReadiness::Ready;
+  }
+
+  const hipError_t status = hipEventQuery(block->exported_event);
+  if (status == hipErrorNotReady) {
+    (void)hipGetLastError();
+    return BlockReadiness::Pending;
+  }
+  if (status != hipSuccess) {
+    RCUTILS_LOG_WARN_NAMED(
+      "hip_memory_pool",
+      "hipEventQuery failed while retiring IPC event; block will not be reused: %s",
+      hipGetErrorName(status));
+    (void)hipGetLastError();
+    block->exported_event_retirement_failed = true;
+    return BlockReadiness::TerminalError;
+  }
+
+  const hipError_t destroy_status = hipEventDestroy(block->exported_event);
+  block->exported_event = nullptr;
+  (void)hipGetLastError();
+  if (destroy_status != hipSuccess) {
+    RCUTILS_LOG_WARN_NAMED(
+      "hip_memory_pool",
+      "hipEventDestroy failed while retiring IPC event; block will not be reused: %s",
+      hipGetErrorName(destroy_status));
+    block->exported_event_retirement_failed = true;
+    return BlockReadiness::TerminalError;
+  }
+  return BlockReadiness::Ready;
+}
+
+HipMemoryPool::BlockReadiness HipMemoryPool::get_block_readiness(VmmBlock * block)
+{
+  if (!block->ipc_meta) {
+    return retire_exported_event(block);
   }
 
   uint64_t publish_us = block->ipc_meta->publish_timestamp_us.load(
     std::memory_order_acquire);
   if (publish_us == 0) {
-    return true;
+    return retire_exported_event(block);
   }
 
   uint64_t now = static_cast<uint64_t>(
     std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
-  if (now < publish_us) {
-    return false;
+  if (now < publish_us || (now - publish_us) < grace_period_us_) {
+    return BlockReadiness::Pending;
   }
-  return (now - publish_us) >= grace_period_us_;
+
+  // UID zero closes the generation. A consumer either holds a counted lease
+  // before this store, or observes a closed/stale UID before opening its IPC
+  // event. Using one atomic for identity and state also prevents a close/reopen
+  // race from accepting a descriptor for the previous generation.
+  block->ipc_meta->uid.store(0, std::memory_order_seq_cst);
+  if (block->ipc_meta->refcount.load(std::memory_order_seq_cst) > 0) {
+    return BlockReadiness::Pending;
+  }
+
+  return retire_exported_event(block);
 }
 
 bool HipMemoryPool::probe_vmm_ipc()

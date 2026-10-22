@@ -238,6 +238,8 @@ std::shared_ptr<void> HipBufferBackend::create_descriptor_with_endpoint(
   if (write_event) {
     hipIpcEventHandle_t event_handle;
     HIP_CHECK(hipIpcGetEventHandle(&event_handle, write_event));
+    pool->retain_exported_event(block, write_event, uid);
+    hip_impl->get_hip_buffer().release_write_event_ownership();
     std::memcpy(
       descriptor->ipc_event_handle.data(), &event_handle, sizeof(hipIpcEventHandle_t));
   } else {
@@ -309,8 +311,7 @@ std::unique_ptr<void, void (*)(void *)> HipBufferBackend::from_descriptor_with_e
         if (ev_err == hipSuccess) {
           imported_buffer.set_write_event(imported_event, true);
         } else {
-          // Retain the upstream cross-process event-open failure behavior.
-          (void)hipGetLastError();
+          throw HipError(__FILE__, __LINE__, "hipIpcOpenEventHandle", ev_err);
         }
       }
 
@@ -321,7 +322,7 @@ std::unique_ptr<void, void (*)(void *)> HipBufferBackend::from_descriptor_with_e
         }};
     } catch (const std::exception & e) {
       RCUTILS_LOG_WARN_NAMED("hip_buffer_backend",
-        "IPC import failed, falling back to CPU: %s", e.what());
+        "IPC import failed; dropping descriptor: %s", e.what());
     }
   }
 

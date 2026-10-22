@@ -65,6 +65,22 @@ if(BUILD_TESTING)
     )
   endif()
 
+  # Uses exec'd importer processes and real HIP VMM allocations. Unsupported
+  # HIP/VMM capabilities skip; stale descriptor acceptance is a real failure.
+  ament_add_gtest(test_hip_buffer_lifecycle
+    test/test_hip_buffer_lifecycle.cpp
+    TIMEOUT 180
+  )
+  if(TARGET test_hip_buffer_lifecycle)
+    target_link_libraries(test_hip_buffer_lifecycle
+      ${PROJECT_NAME}
+      hip_buffer::hip_buffer
+      rosidl_buffer_backend::rosidl_buffer_backend
+      rosidl_runtime_cpp::rosidl_runtime_cpp
+      ${hip_buffer_backend_msgs_TARGETS}
+    )
+  endif()
+
   ament_auto_add_library(hip_image_publisher_component SHARED
     test/src/hip_image_publisher_node.cpp
   )
