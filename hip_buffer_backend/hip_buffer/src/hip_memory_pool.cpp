@@ -30,6 +30,9 @@
 namespace hip_buffer_backend
 {
 
+HipMemoryPool::HipMemoryPool(const HipPoolConfig & config)
+: config_(config) {}
+
 HipMemoryPool::~HipMemoryPool()
 {
   for (;; ) {
@@ -245,7 +248,7 @@ HipMemoryPool::BlockReadiness HipMemoryPool::get_block_readiness(VmmBlock * bloc
   uint64_t now = static_cast<uint64_t>(
     std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
-  if (now < publish_us || (now - publish_us) < grace_period_us_) {
+  if (now < publish_us || (now - publish_us) < config_.grace_period_us) {
     return BlockReadiness::Pending;
   }
 

@@ -24,11 +24,6 @@ using hip_buffer_backend::HipBufferBackend;
 using hip_buffer_backend::HipMemoryPool;
 using hip_buffer_backend::VmmBlock;
 
-// Read from hip_buffer/hip_memory_pool.hpp: grace_period_us_{100000}.
-// It is a private implementation constant, not a configurable test delay.
-// The timestamp-based wait below must track that constant if it changes.
-constexpr auto kPublishGrace = std::chrono::microseconds(100000);
-
 // Probe the HIP operations directly: the pool's boolean capability probe hides
 // error codes, and must not turn allocation/driver/API failures into test skips.
 std::string unavailable_capability()
@@ -157,7 +152,8 @@ protected:
     source_.reset();
     const auto reusable_at = std::chrono::steady_clock::time_point(
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::microseconds(published) + kPublishGrace));
+        std::chrono::microseconds(published) +
+        std::chrono::microseconds(pool_->get_config().grace_period_us)));
     require(reusable_at <= std::chrono::steady_clock::now() + kPhaseTimeout,
       "publication timestamp is outside the phase deadline");
     std::this_thread::sleep_until(reusable_at);

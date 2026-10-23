@@ -36,6 +36,12 @@
 namespace hip_buffer_backend
 {
 
+/// \brief Grace-period configuration for a HIP allocation pool.
+struct HipPoolConfig
+{
+  uint64_t grace_period_us{250000};
+};
+
 struct IPCMetadata
 {
   std::atomic<int32_t> refcount{0};
@@ -73,7 +79,7 @@ struct VmmBlock
 class HipMemoryPool : public std::enable_shared_from_this<HipMemoryPool>
 {
 public:
-  HipMemoryPool() = default;
+  explicit HipMemoryPool(const HipPoolConfig & config = {});
   ~HipMemoryPool();
 
   HipMemoryPool(const HipMemoryPool &) = delete;
@@ -137,6 +143,7 @@ public:
 
   bool is_ipc_capable() const {return ipc_capable_;}
   int get_device_id() const {return device_id_;}
+  const HipPoolConfig & get_config() const noexcept {return config_;}
 
 private:
   enum class BlockReadiness
@@ -162,7 +169,7 @@ private:
   bool ipc_capable_{false};
   bool initialized_{false};
   uint32_t next_block_id_{0};
-  static constexpr uint64_t grace_period_us_{100000};
+  const HipPoolConfig config_;
   std::mt19937_64 uid_rng_{std::random_device{}()};
   std::uniform_int_distribution<uint64_t> uid_dist_{1, UINT64_MAX};
 

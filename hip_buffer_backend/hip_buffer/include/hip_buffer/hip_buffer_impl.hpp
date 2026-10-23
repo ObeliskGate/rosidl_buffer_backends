@@ -38,6 +38,10 @@ namespace hip_buffer_backend
 /// and application DSOs resolve allocations through the same pool instance.
 HIP_BUFFER_PUBLIC std::shared_ptr<HipMemoryPool> get_or_create_global_pool();
 
+/// Configure the process-wide pool before its first successful initialization.
+/// Throws std::logic_error after the global pool has been initialized.
+HIP_BUFFER_PUBLIC void configure_global_pool(const HipPoolConfig & config);
+
 // Process-wide stream for internal ops (clone, to_cpu, resize).
 // Intentionally leaked; the HIP runtime releases it at process exit.
 inline hipStream_t get_internal_stream()

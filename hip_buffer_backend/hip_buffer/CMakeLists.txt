@@ -78,6 +78,17 @@ if(BUILD_TESTING)
     )
   endif()
 
+  ament_add_gtest(test_hip_pool_config
+    test/test_hip_pool_config.cpp
+  )
+  if(TARGET test_hip_pool_config)
+    target_link_libraries(test_hip_pool_config
+      ${PROJECT_NAME}
+      rosidl_buffer::rosidl_buffer
+      rt
+    )
+  endif()
+
 endif()
 
 ament_package()
